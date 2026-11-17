@@ -5,6 +5,7 @@ import (
 	"lamina/internal/catalog"
 	"lamina/internal/index"
 	"lamina/internal/journal"
+	"lamina/internal/materialize"
 	"lamina/internal/snapshot"
 	"lamina/internal/versions"
 	"os"
@@ -18,6 +19,7 @@ type DB struct {
 	catalog      *catalog.Catalog
 	store        *versions.Store
 	indexes      *index.Registry
+	views        *materialize.Manager
 	wal          *journal.WAL
 	sequence     uint64
 	horizon      uint64
@@ -26,6 +28,7 @@ type DB struct {
 	commits      uint64
 	conflicts    uint64
 	queries      uint64
+	viewReads    uint64
 }
 
 func Open(dir string) (*DB, error) {
@@ -47,12 +50,15 @@ func Open(dir string) (*DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	d := &DB{dir: absolute, catalog: catalog.New(), store: versions.New(), wal: w, transactions: map[string]*Transaction{}}
+	d := &DB{dir: absolute, catalog: catalog.New(), store: versions.New(), wal: w, transactions: map[string]*Transaction{}, views: materialize.NewManager()}
 	if !missing {
 		d.catalog = image.Catalog
 		d.store = image.Store
 		d.sequence = image.Sequence
 		d.horizon = image.Horizon
+		if image.Views != nil {
+			d.views = image.Views
+		}
 	}
 	last := w.Base + uint64(len(w.Records))
 	if d.sequence > last {
@@ -69,6 +75,12 @@ func Open(dir string) (*DB, error) {
 		}
 	}
 	d.indexes = index.Build(d.catalog, d.store)
+	// Derived state must explain itself against the reconstructed source:
+	// an unexplained or lagging view refuses startup rather than serving.
+	if err = d.views.Verify(d.catalog, d.store, d.sequence); err != nil {
+		w.Close()
+		return nil, fmt.Errorf("materialized view recovery: %w", err)
+	}
 	for _, relation := range d.catalog.List() {
 		if err = d.unique(relation.Name, nil); err != nil {
 			w.Close()
@@ -106,7 +118,9 @@ func (d *DB) publish(r journal.Record) error {
 		d.wal.Poisoned = true
 		return fault("unavailable", "durable record cannot be applied: %s", err)
 	}
-	if len(r.Writes) > 0 {
+	// The historical index candidate set is maintained outside the derived
+	// view state machine; view maintenance itself happens inside apply.
+	if r.Kind == "commit" && len(r.Writes) > 0 {
 		d.indexes.Apply(d.catalog, r.Writes)
 	}
 	return nil

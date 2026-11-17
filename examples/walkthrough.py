@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Bounded production walkthroughs using only the public HTTP service."""
 import argparse, concurrent.futures, json, os, pathlib, shutil, socket, subprocess, tempfile, time, urllib.request, urllib.error
-WORKFLOWS=['catalog-create','txn-write','snapshot-read','index-build','query-plan','sql-execute','txn-conflict','restart','checkpoint','backup-restore','changes','vacuum','transaction-close','statistics']
+WORKFLOWS=['catalog-create','txn-write','snapshot-read','index-build','query-plan','sql-execute','txn-conflict','restart','checkpoint','backup-restore','changes','vacuum','transaction-close','statistics','materialized-view']
 class Session:
  def __init__(self,binary,root,restore=None):
   self.binary=str(binary);self.root=pathlib.Path(root);self.restore=restore;self.process=None;self.log=None
@@ -152,6 +152,31 @@ def walkthrough(name,binary):
     q=s.query(where=[{'column':'amplitude','op':'>=','value':40}],limit=2)
     require(q['matched']==3 and q['scanned']==3 and len(q['rows'])==2 and q['truncated'],'query fact meanings conflated')
     observations={'query':q,'stats':s.stats()}
+   elif name=='materialized-view':
+    # Eager retained view: maintained inside each source commit, never lagging.
+    view=s.call('POST','/views',{'name':'v_total','relation':'spectra','measures':[{'function':'count'},{'function':'sum','column':'amplitude'}]},201)
+    require(view['refresh']=='on_commit' and view['history']=='retained','view policy defaults wrong')
+    # Invalid declaration must not leave a registered view.
+    s.call('POST','/views',{'name':'v_bad','relation':'spectra','measures':[{'function':'sum','column':'band'}]},400)
+    head_before=s.stats()['sequence']
+    tx=s.begin();s.put(tx,tuple_(8));committed=s.commit(tx)
+    require(committed['sequence']==head_before+1,'source commit did not advance one sequence')
+    cur=s.call('POST','/views/v_total/read',{'at':committed['sequence']})
+    sql_count=s.call('POST','/sql',{'sql':'SELECT count(*) FROM spectra;'})['rows'][0]['count']
+    require(cur['source_sequence']==committed['sequence'] and cur['row']['count']==sql_count and cur['materialized'],'view head not bound to the same source commit')
+    # Historical read returns the pre-change aggregate at its source position.
+    prior=s.call('POST','/views/v_total/read',{'at':seed_seq})
+    require(prior['source_sequence']==seed_seq and prior['row']['count']==7,'historical view lost source correspondence')
+    # Lazy head-only view: cheap writes, recomputes on read, refuses history.
+    s.call('POST','/views',{'name':'v_lazy','relation':'spectra','measures':[{'function':'count'}],'refresh':'on_demand','history':'head_only'},201)
+    lazy=s.call('POST','/views/v_lazy/read',{})
+    require(lazy['row']['count']==sql_count and not lazy['materialized'] and lazy['caught_up'],'lazy view did not recompute on demand')
+    s.call('POST','/views/v_lazy/read',{'at':seed_seq},410)
+    # Restart reconstructs derived state from source and self-verifies.
+    s.call('POST','/checkpoint');s.stop();s.start()
+    recovered=s.call('POST','/views/v_total/verify',{})
+    require(recovered['source_sequence']==s.stats()['sequence'] and recovered['row']['count']==sql_count,'view not trustworthy after restart')
+    observations={'current':cur,'historical':prior,'lazy':lazy,'recovered':recovered}
    else:raise ValueError(name)
    return {'workflow':name,'status':'observed','observations':observations}
   finally:

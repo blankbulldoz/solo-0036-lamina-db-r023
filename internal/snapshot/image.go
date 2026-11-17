@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"lamina/internal/catalog"
+	"lamina/internal/materialize"
 	"lamina/internal/versions"
 	"os"
 )
@@ -14,11 +15,12 @@ import (
 const MaxImage = 128 << 20
 
 type Image struct {
-	Format   int              `json:"format"`
-	Sequence uint64           `json:"sequence"`
-	Horizon  uint64           `json:"horizon"`
-	Catalog  *catalog.Catalog `json:"catalog"`
-	Store    *versions.Store  `json:"store"`
+	Format   int                  `json:"format"`
+	Sequence uint64               `json:"sequence"`
+	Horizon  uint64               `json:"horizon"`
+	Catalog  *catalog.Catalog     `json:"catalog"`
+	Store    *versions.Store      `json:"store"`
+	Views    *materialize.Manager `json:"views,omitempty"`
 }
 type Envelope struct {
 	Format  int             `json:"format"`
@@ -131,6 +133,35 @@ func Validate(image Image) error {
 				return fmt.Errorf("image violates unique index %s", definition.Name)
 			}
 			seen[value.Key()] = true
+		}
+	}
+	if image.Views != nil {
+		for name, view := range image.Views.Views {
+			if view == nil || name != view.Def.Name || !catalog.ValidName(name) {
+				return fmt.Errorf("invalid view metadata")
+			}
+			if view.Def.Created == 0 || view.Def.Created > image.Sequence {
+				return fmt.Errorf("invalid view creation sequence")
+			}
+			if _, ok := image.Catalog.Relations[view.Def.Relation]; !ok {
+				return fmt.Errorf("view references unknown relation")
+			}
+			if err := materialize.ValidateDefinition(image.Catalog, view.Def); err != nil {
+				return fmt.Errorf("invalid view definition: %w", err)
+			}
+			if view.Head.Sequence > image.Sequence {
+				return fmt.Errorf("view head ahead of image sequence")
+			}
+			if view.Watermark < image.Horizon {
+				return fmt.Errorf("view watermark below image horizon")
+			}
+			last := uint64(0)
+			for _, point := range view.Chain {
+				if point.Sequence <= last {
+					return fmt.Errorf("view history not ordered by sequence")
+				}
+				last = point.Sequence
+			}
 		}
 	}
 

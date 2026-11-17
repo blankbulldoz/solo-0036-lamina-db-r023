@@ -11,7 +11,7 @@ import (
 )
 
 func (d *DB) image() snapshot.Image {
-	return snapshot.Image{Format: 1, Sequence: d.sequence, Horizon: d.horizon, Catalog: d.catalog.Clone(), Store: d.store.Clone()}
+	return snapshot.Image{Format: 1, Sequence: d.sequence, Horizon: d.horizon, Catalog: d.catalog.Clone(), Store: d.store.Clone(), Views: d.views.Clone()}
 }
 func (d *DB) Checkpoint() (uint64, error) {
 	d.mu.Lock()

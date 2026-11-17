@@ -19,7 +19,7 @@ go build -o bin/laminad ./cmd/laminad
 python3 examples/walkthrough.py --workflow all
 ```
 
-该命令启动临时实例，执行 14 条真实生产入口工作流，输出逐条观测 JSON，最后关闭实例并删除本次临时目录。可用 `--workflow query-plan` 等方式只运行一条。它是有界运行演示，不是基线测试套件。测试代码和自动化测试基础设施有意留待后续工作，本基线 `testing=deferred`。
+该命令启动临时实例，执行 15 条真实生产入口工作流，输出逐条观测 JSON，最后关闭实例并删除本次临时目录。可用 `--workflow query-plan` 等方式只运行一条。它是有界运行演示，不是基线测试套件。测试代码和自动化测试基础设施有意留待后续工作，本基线 `testing=deferred`。更深的派生状态故障矩阵由 `python3 examples/view_check.py` 单独覆盖。
 
 ## 一个事务
 
@@ -65,6 +65,29 @@ SQL 只支持单条 SELECT：投影或 `count(*)`、`count(column)`、`sum(integ
 单列索引由类型化有序切片维护，保留历史非空值到主键的候选关联。唯一约束允许多个 null。索引在当前提交序号同步构建；构建失败不会发布目录。规划器在可用索引中选择候选键最少的一条，之后读取指定快照的真实版本并执行全部谓词。对早于索引创建时刻的查询使用扫描；含私有写入的事务查询也使用扫描。回收后重建历史候选。
 
 结果的 `plan.candidates` 是访问路径候选键数，`scanned` 是存在可见行并进入残余判断的行数，`matched` 是限制输出前的匹配数。保留历史候选可能导致这些数字差异很大。`force_scan:true` 可用于对照观测。`plan` 是执行事实，不是 I/O 耗时估计。
+
+## 物化视图
+
+物化视图由 LaminaDB 自身维护，先支持用户声明的**固定单关系聚合**：零或多个 AND 连接的等值/范围/空值过滤，度量为 `count(*)` 与整数列 `sum`。定义是唯一被日志持久化的视图事实；所有派生值都能从源版本存储确定性重算，因此重放、检查点和备份还原都能重建出相同的派生状态，恢复后无需人工刷新。
+
+```json
+POST /v1/lamina/views
+{"name":"band_totals","relation":"spectra",
+ "measures":[{"function":"count"},{"function":"sum","column":"amplitude"}],
+ "where":[{"column":"valid","op":"=","value":true}],
+ "refresh":"on_commit","history":"retained"}
+```
+
+**源提交与视图维护共用一个原子边界。** 视图的增量维护运行在发布源写集的同一个状态机 `apply` 步骤和同一把数据库锁内：一条源提交发布后，每个即时视图的 `source_sequence` 必然等于当前源提交序号，不存在“新源行配上未追齐视图”的中间状态。视图维护失败会让该提交整体失败并毒化实例，不会发布部分派生状态。每个回答都带 `source_sequence`，说明派生结果对应的精确源提交；`materialized` 区分答案来自维护状态还是即时全量重算。
+
+两个正交策略覆盖写多/读多与历史保留代价的权衡：
+
+- `refresh`：`on_commit`（默认，每次源提交同步维护，读最便宜、写有增量开销）或 `on_demand`（写入零维护，读取时从源全量重算，`caught_up` 标记是否同时刷新了头部）。
+- `history`：`retained`（默认，保留仅在值变化时追加的历史点，支持保留区间内的历史读取，随历史读窗口增长而占用更多派生存储）或 `head_only`（只保留当前头部，派生存储恒定，只回答当前源序号，历史读返回 410）。
+
+`GET /views` 列出每个视图的定义、状态、`source_sequence`、回收水位和历史点数（保留代价）。`POST /views/{name}/read` 读取，正文 `{"at":<sequence>}` 可省略 `at` 表示当前序号。`POST /views/{name}/verify` 从源全量重算并与维护状态比对，给出显式的源/结果对应核对；实例启动时也会自动执行同样的核对，任何无法解释或滞后的视图都会拒绝启动（fail-closed），而不是留下“已注册但不可解释”的视图。
+
+`sum` 忽略 null，无匹配输入时为 null；int64 求和溢出不会损坏实例，而是把该度量标记为 `status:"overflow"`、该列返回 null 并在 `overflow_columns` 中列出，其他度量和其他视图不受影响，溢出状态在重启后仍然可解释。回收（vacuum）会按相同水位裁剪保留的视图历史，被淘汰序号的历史读取与源历史读一样返回 410。
 
 ## 日志、检查点、还原
 
